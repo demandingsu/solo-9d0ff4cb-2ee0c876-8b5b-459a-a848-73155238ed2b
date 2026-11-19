@@ -11,10 +11,11 @@ from typing import Any
 from fastapi import FastAPI, Path, Query, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 
-from . import db, domain
+from . import db, domain, qc
 from .domain import ApiError
+from .qc_routes import router as qc_router
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +297,18 @@ app = FastAPI(
         "an old delivery even if its chain is later repaired: issue a new delivery.\n\n"
         "Every write runs in a single SQLite `BEGIN IMMEDIATE` transaction, so "
         "corrections, measurement entry and publishing never observe or persist a "
-        "partially committed state."
+        "partially committed state.\n\n"
+        "**Equipment-blank quality control**\n"
+        "Register pumps/tubing (`/equipment`) and their cleaning completion times, "
+        "then record a sampling job per sample (`/sampling-jobs`) linking the sample, "
+        "its UTC working time, the equipment used and any positive equipment blank. "
+        "A positive blank puts the source job's sample and equipment under review; "
+        "later jobs using still-pending equipment inherit the risk, as do the other "
+        "implements shared on that job, until each implement is cleaned. Risk already "
+        "incurred is never erased, multiple blank sources are traced independently, "
+        "and late jobs plus retroactive corrections trigger a full atomic recompute. "
+        "`GET /qc/review` lists pending samples, source blanks and the exact jobs and "
+        "equipment on every propagation path."
     ),
     lifespan=lifespan,
 )
@@ -343,6 +355,7 @@ def create_sample(body: SampleCreate) -> dict[str, Any]:
         result["chain"] = elig.chain.as_dict()
         result["eligible_for_delivery"] = elig.ok
         result["eligibility_problems"] = elig.problems
+        result["qc"] = {"qc_status": "clear", "risk_source_job_ids": [], "finding_count": 0}
     return result
 
 
@@ -389,6 +402,7 @@ def get_sample(sample_id: int = Path(ge=1)) -> dict[str, Any]:
         result["chain"] = elig.chain.as_dict()
         result["eligible_for_delivery"] = elig.ok
         result["eligibility_problems"] = elig.problems
+        result["qc"] = qc.sample_qc_summary(conn, sample_id)
         result["deliveries"] = [
             {
                 "delivery_no": r["delivery_no"],
@@ -816,6 +830,13 @@ def get_delivery(delivery_no: str) -> dict[str, Any]:
         result["revoked_at_utc"] = row["revoked_at_utc"]
         result["revoke_reason"] = row["revoke_reason"]
     return result
+
+
+# ---------------------------------------------------------------------------
+# Quality-control ledger (equipment, cleanings, sampling jobs, review report)
+# ---------------------------------------------------------------------------
+
+app.include_router(qc_router)
 
 
 # ---------------------------------------------------------------------------

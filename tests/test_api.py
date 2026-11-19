@@ -19,9 +19,11 @@ def client(tmp_path, monkeypatch):
     if hasattr(db, "_initialised"):
         db._initialised = False
     importlib.reload(db)
-    from app import domain, main
+    from app import domain, main, qc, qc_routes
 
     importlib.reload(domain)
+    importlib.reload(qc)
+    importlib.reload(qc_routes)
     importlib.reload(main)
     with TestClient(main.app) as c:
         yield c

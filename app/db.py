@@ -118,6 +118,104 @@ CREATE TABLE IF NOT EXISTS sequence_counters (
     name            TEXT PRIMARY KEY,
     value           INTEGER NOT NULL
 );
+
+-- ---------------------------------------------------------------------------
+-- Quality-control: sampling equipment, cleaning ledger, sampling jobs and the
+-- derived cross-contamination findings.
+--
+-- The first three groups are *facts* reported by field QC.  qc_findings is a
+-- fully derived table: every QC write rebuilds it inside the same transaction
+-- from the facts, so late jobs, retroactive corrections and cleanings always
+-- produce a result consistent with one committed ledger state.
+-- ---------------------------------------------------------------------------
+
+-- Reusable sampling implements: pumps and tubing lines, identified by a stable
+-- business code.  Identity is immutable; only cleanings/jobs reference it.
+CREATE TABLE IF NOT EXISTS equipment (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    code            TEXT NOT NULL UNIQUE,
+    kind            TEXT NOT NULL,           -- e.g. pump | tubing
+    description     TEXT,
+    created_at_utc  TEXT NOT NULL
+);
+
+-- One row per completed cleaning of one piece of equipment.  A cleaning at
+-- time t protects jobs whose worked_at is strictly later than t.  Cleanings
+-- may be reported late and corrected afterwards (audited).
+CREATE TABLE IF NOT EXISTS cleanings (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    equipment_id    INTEGER NOT NULL REFERENCES equipment(id),
+    cleaned_at_utc  TEXT NOT NULL,
+    content_hash    TEXT NOT NULL,
+    created_at_utc  TEXT NOT NULL,
+    UNIQUE(equipment_id, cleaned_at_utc)
+);
+CREATE INDEX IF NOT EXISTS idx_cleanings_equipment ON cleanings(equipment_id, cleaned_at_utc);
+
+CREATE TABLE IF NOT EXISTS cleaning_revisions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    cleaning_id     INTEGER NOT NULL REFERENCES cleanings(id),
+    equipment_id    INTEGER NOT NULL REFERENCES equipment(id),
+    action          TEXT NOT NULL,           -- create | correct
+    prev_json       TEXT,
+    new_json        TEXT NOT NULL,
+    reason          TEXT,
+    created_at_utc  TEXT NOT NULL
+);
+
+-- A sampling job is the field operation that produced one registered sample.
+-- It records the UTC working time and the pump/tubing used.  A positive
+-- equipment blank (blank_positive = 1) makes it a contamination *source*.
+CREATE TABLE IF NOT EXISTS sampling_jobs (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id           INTEGER NOT NULL UNIQUE REFERENCES samples(id),
+    worked_at_utc       TEXT NOT NULL,
+    blank_positive      INTEGER NOT NULL DEFAULT 0,
+    blank_sample_code   TEXT,
+    content_hash        TEXT NOT NULL,
+    created_at_utc      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_worked ON sampling_jobs(worked_at_utc);
+
+CREATE TABLE IF NOT EXISTS sampling_job_equipment (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id          INTEGER NOT NULL REFERENCES sampling_jobs(id) ON DELETE CASCADE,
+    equipment_id    INTEGER NOT NULL REFERENCES equipment(id),
+    position        INTEGER NOT NULL,       -- order as reported, 1-based
+    UNIQUE(job_id, equipment_id)
+);
+CREATE INDEX IF NOT EXISTS idx_job_equipment_equipment ON sampling_job_equipment(equipment_id);
+
+CREATE TABLE IF NOT EXISTS sampling_job_revisions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id          INTEGER NOT NULL REFERENCES sampling_jobs(id),
+    sample_id       INTEGER NOT NULL REFERENCES samples(id),
+    action          TEXT NOT NULL,           -- create | correct
+    prev_json       TEXT,
+    new_json        TEXT NOT NULL,
+    reason          TEXT,
+    created_at_utc  TEXT NOT NULL
+);
+
+-- Derived risk paths.  One row per (source blank, subject).  paths_json holds
+-- every distinct propagation path (a subject can be re-contaminated after a
+-- cleaning, which adds a path without erasing the first).  active = 1 means
+-- the equipment is still uncleaned at the timeline end for this source;
+-- sample findings stay active forever once the risk has occurred.
+CREATE TABLE IF NOT EXISTS qc_findings (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_blank_job_id     INTEGER NOT NULL REFERENCES sampling_jobs(id),
+    subject_type            TEXT NOT NULL,   -- sample | equipment
+    sample_id               INTEGER REFERENCES samples(id),
+    equipment_id            INTEGER REFERENCES equipment(id),
+    is_source               INTEGER NOT NULL DEFAULT 0,
+    active                  INTEGER NOT NULL DEFAULT 1,
+    paths_json              TEXT NOT NULL,
+    UNIQUE(source_blank_job_id, subject_type, sample_id, equipment_id)
+);
+CREATE INDEX IF NOT EXISTS idx_qc_sample ON qc_findings(subject_type, sample_id);
+CREATE INDEX IF NOT EXISTS idx_qc_equipment ON qc_findings(subject_type, equipment_id);
+CREATE INDEX IF NOT EXISTS idx_qc_source ON qc_findings(source_blank_job_id);
 """
 
 
